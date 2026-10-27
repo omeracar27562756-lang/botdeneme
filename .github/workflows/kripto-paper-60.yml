@@ -1,0 +1,92 @@
+name: 60 dakika PAPER
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/kripto-paper-60.yml']
+permissions: {contents: read}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MODE: paper
+      PAPER_SESSION_HOURS: '1'
+      CONFIG_FILE: paper-github.yaml
+      BOT_DB_FILE: paper-github.db
+      BINANCE_PUBLIC_WWW: '1'
+      PYTHON_DOTENV_DISABLED: '1'
+      REQUIRE_NOTIFICATIONS: '0'
+      NOTIFICATION_STARTUP_TEST: '0'
+      PYTHONUNBUFFERED: '1'
+      TZ: Europe/Istanbul
+      BINANCE_API_KEY: ''
+      BINANCE_API_SECRET: ''
+      OKX_API_KEY: ''
+      OKX_API_SECRET: ''
+      OKX_API_PASSPHRASE: ''
+      LIVE_TRADING_CONFIRM: ''
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - name: Sanal test ve sonuc
+        run: |
+          set -euo pipefail
+          echo 'e7d929ff1fcd22a2af4d99bce917ad904c7e187580ca383f3a7a73a78b5bba19  KRIPTO-BOT-v7.8-DUZELTILMIS-2026-10-26.zip' | sha256sum -c -
+          unzip -q KRIPTO-BOT-v7.8-DUZELTILMIS-2026-10-26.zip -d bot
+          cd bot/kripto-bot-v7.8
+          test ! -e .env
+          python -m pip install -r requirements.txt
+          python - <<'PY'
+          import json,yaml
+          from pathlib import Path
+          c=yaml.safe_load(Path('config.yaml').read_text(encoding='utf-8'))
+          p=json.loads(Path('configs/paper-60-v2-control.json').read_text(encoding='utf-8'))
+          for k,v in p['overrides'].items(): c[k].update(v)
+          c['genel']['mod']='paper'
+          for k in ('telegram_aktif','whatsapp_aktif','telegram_periyodik_rapor','discord_aktif','pagerduty_aktif'): c['bildirimler'][k]=False
+          c['health_check']['aktif']=False
+          if (c['paper']['bakiye'],c['risk']['paper_max_pozisyon'],c['futures']['max_parite']) != (1000,6,100): raise SystemExit('Paper profili hatali')
+          Path('paper-github.yaml').write_text(yaml.safe_dump(c,allow_unicode=True,sort_keys=False),encoding='utf-8')
+          PY
+          curl -fsS --max-time 15 https://www.binance.com/fapi/v1/ping >/dev/null
+          curl -fsS --max-time 15 https://www.okx.com/api/v5/public/time >/dev/null
+          python - <<'PY'
+          import asyncio,json,websockets
+          from src.config import load_config
+          c=load_config()
+          if c['genel']['mod']!='paper' or any(c['api'].get(k) for k in ('binance_key','binance_secret','okx_key','okx_secret','okx_passphrase')): raise SystemExit('Paper guvenlik hatasi')
+          async def ws(url,sub=None):
+              async with websockets.connect(url,open_timeout=15,close_timeout=3) as w:
+                  if sub: await w.send(json.dumps(sub))
+                  while not json.loads(await asyncio.wait_for(w.recv(),15)).get('data'): pass
+          async def main():
+              await asyncio.wait_for(asyncio.gather(ws('wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade'),ws('wss://ws.okx.com:8443/ws/v5/public',{'op':'subscribe','args':[{'channel':'trades','instId':'BTC-USDT-SWAP'}]})),30)
+          asyncio.run(main())
+          PY
+          timeout --signal=INT --kill-after=60s 75m python -u -m src.main 2>&1 | tee paper-session.log
+          python - <<'PY'
+          import json,os
+          from pathlib import Path
+          r=Path('reports');f=sorted(r.glob('oturum_analizi_*.json'))
+          if not f or not (r/'last_exit.json').exists(): raise SystemExit('Nihai rapor yok')
+          d=json.loads(f[-1].read_text());s=d['session'];e=json.loads((r/'last_exit.json').read_text())
+          if s.get('closed_at',0)-s.get('start_ts',0)<3599 or not s.get('closeout_completed') or s.get('closeout_open_positions')!=0 or not s.get('shadow_closeout_completed') or e.get('value')!='scheduled_paper_session_complete': raise SystemExit('Planli kapanis dogrulanamadi')
+          for n in ('binance','okx'):
+              w=d.get('exchange_evidence',{}).get('websocket',{}).get(n,{})
+              if not w.get('trade_messages') or not w.get('book_messages'): raise SystemExit(n+' veri kaniti eksik')
+          o=d['overall'];text=f"# Paper sonucu\n\nKapanan islem: {o['count']}\n\nNet K/Z: {o['net_pnl_usdt']:+.4f} USDT\n\n1000 USDT sanal bakiye; gercek emir yok, bildirimler kapali.\n"
+          (r/'PAPER_TEST_OZETI.md').write_text(text,encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f: f.write(text)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kripto-paper-rapor-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            bot/kripto-bot-v7.8/paper-session.log
+            bot/kripto-bot-v7.8/reports/
